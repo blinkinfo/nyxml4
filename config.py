@@ -57,4 +57,4 @@ COINBASE_CANDLE_URL: str = "https://api.exchange.coinbase.com/products/BTC-USD/c
 # Auto-Redeem
 # ---------------------------------------------------------------------------
 # Scheduler interval (minutes) between automatic redemption scans.
-AUTO_REDEEM_INTERVAL_MINUTES: int = int(os.getenv("AUTO_REDEEM_INTERVAL_MINUTES", "30"))
+AUTO_REDEEM_INTERVAL_MINUTES: int = int(os.getenv("AUTO_REDEEM_INTERVAL_MINUTES", "5"))
