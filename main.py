@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 
+from telegram import BotCommand
 from telegram.ext import Application
 
 import config as cfg
@@ -68,6 +69,15 @@ def main() -> None:
         """
         start_scheduler(application, poly_client)
         await recover_unresolved()
+
+        # Register bot commands so they appear in Telegram menu
+        await application.bot.set_my_commands([
+            BotCommand("status", "Portfolio overview & bot health"),
+            BotCommand("signals", "Recent trading signals"),
+            BotCommand("trades", "Open & recent trades"),
+            BotCommand("settings", "View/adjust bot settings"),
+            BotCommand("help", "Show available commands"),
+        ])
 
     application = (
         Application.builder()
