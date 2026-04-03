@@ -580,7 +580,7 @@ def _redeem_via_safe(
 
     # --- Sign the Safe tx hash with the EOA private key ---
     # signHash returns a SignedMessage with v, r, s
-    signed = w3.eth.account.signHash(safe_tx_hash, private_key=private_key)
+    signed = w3.eth.account._sign_hash(safe_tx_hash, private_key=private_key)
     v = signed.v
     r = signed.r
     s = signed.s
