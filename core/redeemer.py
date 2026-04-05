@@ -234,13 +234,20 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
     A position is redeemable when ALL of the following hold:
       1. size > 0.001  (we hold tokens)
       2. redeemable == True  (market is resolved, API already computed this)
-      3. curPrice >= 0.99  (our outcome won — skip losing positions)
+      3. curPrice is settled: >= 0.99 (won) OR <= 0.01 (lost)
+         Prices in-between mean the market is still live -- skip those.
+
+    The on-chain redeemPositions() call with index_sets=[1, 2] handles both
+    outcomes correctly: winning tokens are redeemed for USDC, losing tokens
+    are burned for $0. Calling it for a lost position is safe and necessary
+    to clear worthless ERC-1155 tokens from the wallet.
 
     API schema (flat Polymarket Data API /positions response):
       conditionId, size, curPrice, redeemable, outcomeIndex, outcome, title
 
     Returns a list of dicts with:
-      condition_id, outcome_index, size, title, raw, cur_price
+      condition_id, outcome_index, size, title, raw, cur_price, won
+    The `won` field is True when curPrice >= 0.99, False when curPrice <= 0.01.
     """
     redeemable: list[dict[str, Any]] = []
 
@@ -255,12 +262,15 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
             if not pos.get("redeemable"):
                 continue
 
-            # 3. Our outcome must have won (curPrice >= 0.99)
+            # 3. Outcome must be settled: won (>=0.99) or lost (<=0.01).
+            #    Prices between 0.01 and 0.99 mean the market is still live.
             cur_price = float(pos.get("curPrice") or 0)
-            if cur_price < 0.99:
+            won = cur_price >= 0.99
+            lost = cur_price <= 0.01
+            if not (won or lost):
                 continue
 
-            # conditionId — ensure 0x prefix
+            # conditionId -- ensure 0x prefix
             condition_id = pos.get("conditionId", "")
             if not condition_id:
                 continue
@@ -271,12 +281,13 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
             title = pos.get("title", condition_id[:16])
 
             redeemable.append({
-                "condition_id": condition_id,
+                "condition_id":  condition_id,
                 "outcome_index": outcome_index,
-                "size": size,
-                "title": title,
-                "raw": pos,
-                "cur_price": cur_price,
+                "size":          size,
+                "title":         title,
+                "raw":           pos,
+                "cur_price":     cur_price,
+                "won":           won,
             })
 
         except Exception:
@@ -284,12 +295,6 @@ def find_redeemable_positions(positions: list[dict[str, Any]]) -> list[dict[str,
             continue
 
     return redeemable
-
-
-
-# ---------------------------------------------------------------------------
-# On-chain redemption
-# ---------------------------------------------------------------------------
 
 async def redeem_position(
     condition_id_hex: str,

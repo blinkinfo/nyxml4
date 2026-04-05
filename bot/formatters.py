@@ -6,6 +6,13 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# Consistent separator
+# ---------------------------------------------------------------------------
+
+SEP = "\u2501" * 20
+
+
+# ---------------------------------------------------------------------------
 # Live notifications (sent by scheduler)
 # ---------------------------------------------------------------------------
 
@@ -213,14 +220,16 @@ def format_trade_retrying(
 
 def format_redeem_preview(results: list[dict]) -> str:
     """Format /redeem dry-run scan results before user confirms."""
-    SEP = "\u2501" * 20
     if not results:
         return (
             "\U0001f4b0 <b>Redeem \u2014 No Positions Found</b>\n"
             + SEP + "\n"
-            "No redeemable winning positions detected in your wallet.\n"
+            "No redeemable positions detected in your wallet.\n"
             "Positions only appear here once the market resolves on-chain."
         )
+
+    won_count  = sum(1 for r in results if r.get("won"))
+    lost_count = len(results) - won_count
 
     lines = [
         f"\U0001f4b0 <b>Redeem Preview ({len(results)} position(s) found)</b>",
@@ -228,19 +237,20 @@ def format_redeem_preview(results: list[dict]) -> str:
     ]
     for i, r in enumerate(results, 1):
         title = (r.get("title") or r.get("condition_id", "Unknown"))[:60]
-        size = r.get("size", 0)
-        lines.append(f"{i}. {title}")
+        size  = r.get("size", 0)
+        label = "\u2705 WON" if r.get("won") else "\u274c LOST"
+        lines.append(f"{i}. {label}  {title}")
         lines.append(f"   \U0001f4b0 Size: {size:.4f} shares")
     lines += [
         SEP,
-        "Tap <b>Confirm Redeem</b> to execute all redemptions on-chain.",
+        f"Won: <b>{won_count}</b>  Lost: <b>{lost_count}</b>",
+        "Tap <b>Confirm Redeem</b> to execute all redemptions on-chain.\n"
+        "<i>Lost positions are burned for $0 to clear them from your wallet.</i>",
     ]
     return "\n".join(lines)
 
-
 def format_redeem_results(results: list[dict]) -> str:
     """Format the outcome after redemption transactions are sent."""
-    SEP = "\u2501" * 20
     if not results:
         return (
             "\U0001f4b0 <b>Redeem Complete</b>\n"
@@ -249,7 +259,7 @@ def format_redeem_results(results: list[dict]) -> str:
         )
 
     success_count = sum(1 for r in results if r.get("success"))
-    fail_count = len(results) - success_count
+    fail_count    = len(results) - success_count
 
     lines = [
         f"\U0001f4b0 <b>Redeem Complete</b>  \u2705 {success_count}  \u274c {fail_count}",
@@ -257,46 +267,51 @@ def format_redeem_results(results: list[dict]) -> str:
     ]
     for i, r in enumerate(results, 1):
         title = (r.get("title") or r.get("condition_id", "Unknown"))[:55]
-        size = r.get("size", 0)
+        size  = r.get("size", 0)
+        won   = r.get("won", True)   # default True for backwards-compat
+        outcome_label = "WON" if won else "LOST"
+        recovered     = f"${size:.2f}" if won else "$0.00"
         if r.get("success"):
             tx = r.get("tx_hash", "")
             short_tx = tx[:10] + "..." + tx[-6:] if tx and len(tx) > 16 else (tx or "N/A")
             gas = r.get("gas_used")
             gas_str = f"  gas={gas:,}" if gas else ""
-            lines.append(f"\u2705 {i}. {title}")
-            lines.append(f"   {size:.4f} shares  tx: <code>{short_tx}</code>{gas_str}")
+            lines.append(f"\u2705 {i}. [{outcome_label}] {title}")
+            lines.append(f"   {size:.4f} shares  recovered: {recovered}  tx: <code>{short_tx}</code>{gas_str}")
         else:
             err = (r.get("error") or "unknown error")[:200]
-            lines.append(f"\u274c {i}. {title}")
+            lines.append(f"\u274c {i}. [{outcome_label}] {title}")
             lines.append(f"   Error: {err}")
     lines.append(SEP)
     return "\n".join(lines)
-
 
 def format_auto_redeem_notification(results: list[dict]) -> str:
     """Compact notification sent by the auto-redeem scheduler job."""
     success = [r for r in results if r.get("success")]
     failed  = [r for r in results if not r.get("success")]
-    SEP = "\u2501" * 20
 
     lines = [
         f"\U0001f916 <b>Auto-Redeem Complete</b>  \u2705 {len(success)}  \u274c {len(failed)}",
         SEP,
     ]
     for r in success:
-        title = (r.get("title") or r.get("condition_id", "?"))[:55]
-        tx = r.get("tx_hash", "")
-        short_tx = tx[:10] + "..." + tx[-6:] if tx and len(tx) > 16 else (tx or "N/A")
-        lines.append(f"\u2705 {title}")
-        lines.append(f"   tx: <code>{short_tx}</code>")
+        title     = (r.get("title") or r.get("condition_id", "?"))[:55]
+        won       = r.get("won", True)
+        outcome_label = "WON" if won else "LOST"
+        recovered     = f"${r.get('size', 0):.2f}" if won else "$0.00"
+        tx        = r.get("tx_hash", "")
+        short_tx  = tx[:10] + "..." + tx[-6:] if tx and len(tx) > 16 else (tx or "N/A")
+        lines.append(f"\u2705 [{outcome_label}] {title}")
+        lines.append(f"   recovered: {recovered}  tx: <code>{short_tx}</code>")
     for r in failed:
         title = (r.get("title") or r.get("condition_id", "?"))[:55]
-        err = (r.get("error") or "unknown")[:200]
-        lines.append(f"\u274c {title}")
+        won   = r.get("won", True)
+        outcome_label = "WON" if won else "LOST"
+        err   = (r.get("error") or "unknown")[:200]
+        lines.append(f"\u274c [{outcome_label}] {title}")
         lines.append(f"   {err}")
     lines.append(SEP)
     return "\n".join(lines)
-
 
 def format_error_alert(context: str, error: str, detail: str | None = None) -> str:
     """Format a system-level error alert for Telegram.
@@ -310,7 +325,6 @@ def format_error_alert(context: str, error: str, detail: str | None = None) -> s
     detail : str | None
         Optional full traceback or extended detail (truncated to 600 chars).
     """
-    SEP = "\u2501" * 20
     lines = [
         f"\u26a0\ufe0f <b>Error \u2014 {context}</b>",
         SEP,
@@ -325,7 +339,6 @@ def format_error_alert(context: str, error: str, detail: str | None = None) -> s
 
 def format_redemption_history(stats: dict, recent: list[dict]) -> str:
     """Format the /redemptions dashboard."""
-    SEP = "\u2501" * 20
     lines = [
         "\U0001f4b0 <b>Redemption History</b>",
         SEP,
@@ -362,7 +375,6 @@ def format_signal_stats(stats: dict[str, Any], label: str = "All Time") -> str:
     if stats.get("current_streak") and stats.get("current_streak_type"):
         streak_str = f"{stats['current_streak']}{stats['current_streak_type']}"
 
-    SEP = "\u2501" * 20
     lines = [
         f"\U0001f4ca <b>Signal Performance ({label})</b>",
         SEP,
@@ -387,7 +399,6 @@ def format_trade_stats(stats: dict[str, Any], label: str = "All Time") -> str:
     sign = "+" if stats["net_pnl"] >= 0 else ""
     roi_sign = "+" if stats["roi_pct"] >= 0 else ""
 
-    SEP = "\u2501" * 20
     lines = [
         f"\U0001f4b0 <b>Trade Performance ({label})</b>",
         SEP,
@@ -428,7 +439,11 @@ def format_status(
     bal_text = f"{balance:.2f} USDC" if balance is not None else "N/A"
     sig_text = last_signal or "None"
 
-    SEP = "\u2501" * 20
+    if trade_mode == "pct":
+        mode_line = f"\U0001f4b5 Trade Mode: PCT {trade_pct:.1f}%"
+    else:
+        mode_line = f"\U0001f4b5 Trade Mode: FIXED ${trade_amount:.2f}"
+
     lines = [
         "\U0001f916 <b>AutoPoly Status</b>",
         SEP,
@@ -437,7 +452,7 @@ def format_status(
         f"\U0001f4b0 Balance: {bal_text}",
         SEP,
         f"\U0001f916 AutoTrade: {at_text}",
-        f"\U0001f4b5 Trade Mode: {'PCT ' + str(trade_pct) + '%' if trade_mode == 'pct' else 'FIXED $' + f'{trade_amount:.2f}'}",
+        mode_line,
         f"\U0001f4ca Open Positions: {open_positions}",
         f"\U0001f4b0 Auto-Redeem: {ar_text}",
         SEP,
@@ -486,17 +501,17 @@ def format_recent_trades(trades: list[dict[str, Any]]) -> str:
 
 def format_help() -> str:
     return (
-        "\u2753 <b>AutoPoly Commands</b>\n\n"
-        "/start \u2014 Main menu\n"
-        "/status \u2014 Bot status & balance\n"
-        "/signals \u2014 Signal performance stats\n"
-        "/trades \u2014 Trade P&L dashboard\n"
-        "/redeem \u2014 Scan & redeem winning positions\n"
-        "/redemptions \u2014 Redemption history\n"
-        "/settings \u2014 Toggle autotrade/auto-redeem, set amount\n"
-        "/demo \u2014 Demo trading mode & virtual bankroll\n"
-        "/patterns \u2014 Per-pattern win rate & P&L stats\n"
-        "/help \u2014 This help message\n\n"
+        "\u2753 <b>Help & Commands</b>\n"
+        + SEP + "\n"
+        "<b>Dashboard</b>\n"
+        "/status  &middot; /signals  &middot; /trades  &middot; /patterns\n\n"
+        "<b>Actions</b>\n"
+        "/redeem  &middot; /redemptions\n\n"
+        "<b>Config</b>\n"
+        "/settings  &middot; /demo\n\n"
+        "<b>Misc</b>\n"
+        "/help  &middot; /start\n"
+        + SEP + "\n"
         "<b>How it works:</b>\n"
         "Every 5 minutes the bot analyses the last six closed BTC-USD "
         "5-minute candles from Coinbase, builds a 6-character pattern "
@@ -507,6 +522,7 @@ def format_help() -> str:
         "When enabled, the bot periodically scans your wallet for resolved "
         "winning positions and calls redeemPositions() on the Polygon CTF "
         "contract to collect your USDC.e. Use /redeem for a manual scan."
+        + SEP
     )
 
 
@@ -518,7 +534,6 @@ def format_demo_stats(stats: dict, bankroll: float, label: str = "All Time") -> 
     """Format the demo trade P&L dashboard."""
     sign = "+" if stats["net_pnl"] >= 0 else ""
     roi_sign = "+" if stats["roi_pct"] >= 0 else ""
-    SEP = "\u2501" * 20
     lines = [
         f"\U0001f9ea <b>Demo Trade Performance ({label})</b>",
         SEP,
@@ -561,7 +576,6 @@ def format_demo_recent_trades(trades: list) -> str:
 
 def format_pattern_stats(rows: list[dict[str, Any]]) -> str:
     """Format per-pattern performance stats as a Telegram HTML message."""
-    SEP = "\u2501" * 20
     if not rows:
         return (
             "\U0001f522 <b>Pattern Performance</b>\n"
@@ -574,7 +588,9 @@ def format_pattern_stats(rows: list[dict[str, Any]]) -> str:
         "\U0001f522 <b>Pattern Performance</b>",
         SEP,
     ]
-    for r in rows:
+    for i, r in enumerate(rows):
+        if i > 0:
+            lines.append(SEP)
         wl = f"{r['wl_ratio']}" if r["wl_ratio"] != float("inf") else "\u221e"
         roi_sign = "+" if r["roi_pct"] >= 0 else ""
         pnl_sign = "+" if r["net_pnl"] >= 0 else ""
