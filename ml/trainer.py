@@ -237,18 +237,55 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
     val_probs = model.predict(X_val)
     best_threshold, best_wr, best_trades_per_day = sweep_threshold(val_probs, y_val)
 
-    # DOWN threshold: symmetric complement of UP threshold.
-    # P(DOWN) = 1 - P(UP) >= down_threshold  <=>  P(UP) <= 1 - down_threshold
-    # Stored so ml_strategy can apply it without re-deriving it at runtime.
-    down_threshold = round(1.0 - best_threshold, 4)
+    # ---------------------------------------------------------------------------
+    # DOWN threshold sweep — validate independently on the same val set.
+    # P(DOWN) = 1 - P(UP).  Labels are inverted: 1 means price actually went DOWN.
+    # This is NOT a symmetric assumption — the sweep finds the actual best
+    # threshold for the inverted probability and checks whether WR >= 59%.
+    # down_enabled=True only when the DOWN side passes the same deployment gate.
+    # ---------------------------------------------------------------------------
+    down_probs_val = 1.0 - val_probs
+    y_val_down = 1 - y_val  # label=1 means price went DOWN
+    down_threshold, down_val_wr, down_val_tpd = sweep_threshold(down_probs_val, y_val_down)
+    down_enabled = down_val_wr >= 0.59
+
+    log.info(
+        "train: DOWN sweep — down_threshold=%.3f down_val_wr=%.4f down_val_tpd=%.1f down_enabled=%s",
+        down_threshold, down_val_wr, down_val_tpd, down_enabled,
+    )
+    if not down_enabled:
+        log.warning(
+            "train: DOWN side did NOT pass deployment gate (down_val_wr=%.4f < 0.59). "
+            "DOWN trades will be disabled for this model.",
+            down_val_wr,
+        )
 
     # Evaluate on test set using threshold chosen from val set
     test_probs = model.predict(X_test)
     test_metrics = evaluate_at_threshold(test_probs, y_test, best_threshold)
 
+    # DOWN test set evaluation — confirms DOWN threshold holds on held-out data.
+    # If DOWN test WR < 59%, override down_enabled to False regardless of val result.
+    down_test_metrics = evaluate_at_threshold(
+        1.0 - test_probs,  # P(DOWN) on test set
+        1 - y_test,        # DOWN labels on test set
+        down_threshold,
+    )
+    if down_enabled and down_test_metrics["wr"] < 0.59:
+        log.warning(
+            "train: DOWN passed val gate but FAILED test gate "
+            "(down_test_wr=%.4f < 0.59). Disabling DOWN.",
+            down_test_metrics["wr"],
+        )
+        down_enabled = False
+
     log.info(
         "train: val_wr=%.4f threshold=%.3f | test_wr=%.4f test_trades=%d",
         best_wr, best_threshold, test_metrics["wr"], test_metrics["trades"],
+    )
+    log.info(
+        "train: down_val_wr=%.4f down_threshold=%.3f | down_test_wr=%.4f down_test_trades=%d down_enabled=%s",
+        down_val_wr, down_threshold, down_test_metrics["wr"], down_test_metrics["trades"], down_enabled,
     )
 
     # -----------------------------------------------------------------------
@@ -273,14 +310,23 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
     # The caller decides what to do with a blocked candidate.
     metadata = {
         "train_date": datetime.utcnow().isoformat(),
+        # UP side
         "threshold": best_threshold,
-        "down_threshold": down_threshold,
         "val_wr": best_wr,
         "val_trades_per_day": best_trades_per_day,
         "test_wr": test_metrics["wr"],
         "test_precision": test_metrics["precision"],
         "test_trades": test_metrics["trades"],
         "test_trades_per_day": test_metrics["trades_per_day"],
+        # DOWN side — independently swept and validated
+        "down_threshold": down_threshold,
+        "down_enabled": down_enabled,
+        "down_val_wr": down_val_wr,
+        "down_val_tpd": down_val_tpd,
+        "down_test_wr": down_test_metrics["wr"],
+        "down_test_trades": down_test_metrics["trades"],
+        "down_test_tpd": down_test_metrics["trades_per_day"],
+        # Common
         "sample_count": n,
         "train_size": val_start,
         "val_size": train_end - val_start,
@@ -295,6 +341,10 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "model": model,
         "threshold": best_threshold,
         "down_threshold": down_threshold,
+        "down_enabled": down_enabled,
+        "down_val_wr": down_val_wr,
+        "down_val_tpd": down_val_tpd,
+        "down_test_metrics": down_test_metrics,
         "test_metrics": test_metrics,
         "val_wr": best_wr,
         "val_trades": best_trades_per_day,

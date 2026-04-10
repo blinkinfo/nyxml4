@@ -144,6 +144,20 @@ class MLStrategy(BaseStrategy):
         # Symmetric fallback: mirror of the UP threshold around 0.5
         return round(1.0 - up_threshold, 4)
 
+    def _get_down_enabled(self) -> bool:
+        """Read down_enabled flag from current model metadata.
+
+        Returns False if metadata is missing or down_enabled is not set,
+        ensuring backwards-compatibility with models trained before Option B.
+        """
+        try:
+            meta = model_store.load_metadata(self._model_slot)
+            if meta is not None:
+                return bool(meta.get("down_enabled", False))
+        except Exception:
+            pass
+        return False
+
     async def check_signal(self) -> dict[str, Any] | None:
         """Generate an ML-based signal for slot N+1.
 
@@ -213,16 +227,20 @@ class MLStrategy(BaseStrategy):
             # P(DOWN) = 1 - P(UP)
             prob_down = round(1.0 - prob, 6)
 
-            up_qualifies   = prob      >= up_threshold
-            # DOWN uses the same bar as UP applied to prob_down — this creates
-            # a symmetric dead zone: skip if (1-up_threshold) < prob < up_threshold.
-            # Using down_threshold directly would widen the fire zone asymmetrically
-            # when down_threshold != up_threshold (e.g. from DB override).
-            # The stricter of the two is always used here: max(down_threshold, up_threshold).
-            down_qualifies = prob_down >= max(down_threshold, up_threshold)
+            up_qualifies = prob >= up_threshold
+
+            # DOWN gate: only fire if the model's DOWN side was independently
+            # validated (down_enabled=True in metadata). If the model was trained
+            # before Option B or failed the DOWN sweep, down_enabled=False and
+            # no DOWN trade ever fires regardless of prob_down.
+            down_enabled = self._get_down_enabled()
+            down_qualifies = down_enabled and (prob_down >= down_threshold)
 
             # Determine direction:
-            #   - Both qualify  → pick the one with the larger margin over its threshold
+            #   - Both qualify  → pick the one with the larger margin over its threshold.
+            #     With independently validated thresholds this is extremely rare
+            #     (would require p_up >= up_thr AND 1-p_up >= down_thr simultaneously)
+            #     but we handle it cleanly rather than crashing.
             #   - Only one      → pick that one
             #   - Neither       → skip
             if up_qualifies and down_qualifies:
@@ -238,18 +256,25 @@ class MLStrategy(BaseStrategy):
             elif down_qualifies:
                 side = "Down"
             else:
+                # Build skip reason — include DOWN gate status so logs are clear
+                if not down_enabled:
+                    down_reason = "DOWN disabled (not validated)"
+                else:
+                    down_reason = f"p_down={prob_down:.4f}<{down_threshold:.3f}"
                 return {
                     **base_fields,
                     "pattern": f"p={prob:.4f}<{up_threshold:.3f}",
                     "reason": (
                         f"Below threshold (p_up={prob:.4f}<{up_threshold:.3f}, "
-                        f"p_down={prob_down:.4f}<{down_threshold:.3f})"
+                        f"{down_reason})"
                     ),
                 }
 
             log.info(
-                "MLStrategy: side=%s p_up=%.4f p_down=%.4f up_thr=%.3f down_thr=%.3f slot=%s",
-                side, prob, prob_down, up_threshold, down_threshold, slot_n1["slug"],
+                "MLStrategy: side=%s p_up=%.4f p_down=%.4f up_thr=%.3f down_thr=%.3f "
+                "down_enabled=%s slot=%s",
+                side, prob, prob_down, up_threshold, down_threshold,
+                down_enabled, slot_n1["slug"],
             )
 
             # Fetch Polymarket prices — identical to PatternStrategy

@@ -1085,7 +1085,13 @@ async def _retrain_background(application, chat_id) -> None:
         )
         meta = model_store.load_metadata("candidate") or {}
         threshold = result.get("threshold", 0.535)
+        # down_threshold now comes from the real DOWN sweep in trainer.py,
+        # NOT the arithmetic complement. Falls back to complement only for
+        # models trained before Option B was implemented.
         down_threshold = result.get("down_threshold", round(1.0 - threshold, 4))
+        down_enabled   = result.get("down_enabled", False)
+        down_val_wr    = result.get("down_val_wr", 0.0)
+        down_test_wr   = result.get("down_test_metrics", {}).get("wr", 0.0)
 
         # Persist up/down thresholds to DB
         try:
@@ -1101,20 +1107,26 @@ async def _retrain_background(application, chat_id) -> None:
             log.warning("Retrain: failed to save candidate to DB: %s", db_exc)
 
         if result.get("blocked"):
-            # Model failed the 59% gate — saved to candidate, user decides
+            # UP side failed the 59% gate — saved to candidate, user decides
             log.warning(
                 "Retrain: candidate blocked by deployment gate. "
-                "val_wr=%.4f test_wr=%.4f threshold=%.3f",
+                "val_wr=%.4f test_wr=%.4f threshold=%.3f | "
+                "down_enabled=%s down_val_wr=%.4f down_test_wr=%.4f down_threshold=%.3f",
                 result.get("val_wr", 0),
                 result.get("test_metrics", {}).get("wr", 0),
                 threshold,
+                down_enabled, down_val_wr, down_test_wr, down_threshold,
             )
             text = format_retrain_blocked(meta, threshold)
             await notify(text, reply_markup=retrain_blocked_keyboard())
         else:
-            log.info("Retrain complete. val_wr=%.4f test_wr=%.4f",
-                     result.get("val_wr", 0),
-                     result.get("test_metrics", {}).get("wr", 0))
+            log.info(
+                "Retrain complete. val_wr=%.4f test_wr=%.4f | "
+                "down_enabled=%s down_val_wr=%.4f down_test_wr=%.4f down_threshold=%.3f",
+                result.get("val_wr", 0),
+                result.get("test_metrics", {}).get("wr", 0),
+                down_enabled, down_val_wr, down_test_wr, down_threshold,
+            )
             text = format_retrain_complete(meta, threshold)
             await notify(text)
 
