@@ -18,53 +18,56 @@ def _e(value: object) -> str:
 # column-aligned regardless of value magnitude.
 # ---------------------------------------------------------------------------
 
-def _risk_dd_dollar(v: float) -> str:
-    """Format a drawdown dollar value to a fixed 7-char field.
+_RISK_VAL_W = 10
 
-    Examples:  -$3.50  ->  '-$3.50 '   $0.00  ->  '$0.00  '
+
+def _risk_dd_dollar(v: float) -> str:
+    """Format a drawdown dollar value to a fixed-width, right-aligned field.
+
+    Examples:  -$3.50  ->  '    -$3.50'   $0.00  ->  '     $0.00'
     Negative values render as '-$X.XX', zero/positive as '$0.00'.
-    Field width 7 accommodates up to -$99.99 without overflow.
+    Width is sized for Telegram code-block alignment and larger DD values.
     """
     s = f"-${abs(v):.2f}" if v < 0 else "$0.00"
-    return s.ljust(7)
+    return s.rjust(_RISK_VAL_W)
 
 
 def _risk_dd_pct(v: float) -> str:
-    """Format a drawdown percentage to a fixed 7-char field.
+    """Format a drawdown percentage to a fixed-width, right-aligned field.
 
-    Examples:  -12.3%  ->  '-12.3% '   0.0%  ->  '0.0%   '
-    Field width 7 accommodates up to -99.9% without overflow.
+    Examples:  -12.3%  ->  '    -12.3%'   0.0%  ->  '      0.0%'
+    Width is sized for Telegram code-block alignment and large magnitudes.
     """
     s = f"{v:.1f}%" if v < 0 else "0.0%"
-    return s.ljust(7)
+    return s.rjust(_RISK_VAL_W)
 
 
 def _risk_streak(v: int) -> str:
-    """Format a streak integer to a fixed 7-char field.
+    """Format a streak integer to a fixed-width, right-aligned field.
 
-    All risk value helpers share the same field width (7) so that a single
-    space after the value always places the │ separator at the same column.
+    All risk value helpers share the same width so the │ separator stays
+    aligned across all risk table rows in Telegram monospace rendering.
 
-    Examples:  7  ->  '7      '   12  ->  '12     '
+    Examples:  7  ->  '         7'   12  ->  '        12'
     """
-    return str(v).ljust(7)
+    return str(v).rjust(_RISK_VAL_W)
 
 
 def _risk_pf(v: float) -> str:
-    """Format a profit factor to a fixed 7-char field.
+    """Format a profit factor to a fixed-width, right-aligned field.
 
-    Examples:  1.23  ->  '1.23   '   inf  ->  '∞      '
+    Examples:  1.23  ->  '      1.23'   inf  ->  '         ∞'
     """
     s = "\u221e" if v == float("inf") else f"{v:.2f}"
-    return s.ljust(7)
+    return s.rjust(_RISK_VAL_W)
 
 
 def _risk_sharpe(v: float) -> str:
-    """Format a Sharpe ratio to a fixed 7-char field.
+    """Format a Sharpe ratio to a fixed-width, right-aligned field.
 
-    Examples:  1.23  ->  '1.23   '   -0.45  ->  '-0.45  '
+    Examples:  1.23  ->  '      1.23'   -0.45  ->  '     -0.45'
     """
-    return f"{v:.2f}".ljust(7)
+    return f"{v:.2f}".rjust(_RISK_VAL_W)
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +920,7 @@ def format_retrain_blocked(meta: dict, threshold: float) -> str:
 
     if val_risk or test_risk:
         # Column layout (monospace) — identical to format_retrain_complete.
-        # All val fields normalised to 7 chars so │ always lands at col 23.
+        # All value fields are fixed-width so │ remains aligned.
         v_dd_d  = _risk_dd_dollar(val_risk.get("max_dd_dollar", 0.0))
         t_dd_d  = _risk_dd_dollar(test_risk.get("max_dd_dollar", 0.0))
         v_dd_p  = _risk_dd_pct(val_risk.get("max_dd_pct", 0.0))
@@ -932,18 +935,22 @@ def format_retrain_blocked(meta: dict, threshold: float) -> str:
         t_sh    = _risk_sharpe(test_risk.get("sharpe", 0.0))
         wf_d    = _risk_dd_dollar(wf_dd_d)
         wf_p    = _risk_dd_pct(wf_dd_pct)
+        wf_ls_s = _risk_streak(wf_ls)
+        _blank  = " " * _RISK_VAL_W
         risk_section = (
             "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
             "\u2502 \u26a0\ufe0f <b>Risk</b>\n"
             "\u2502 <code>"
-            "Metric         Val     \u2502 Test   \n"
+            "Metric         Val        \u2502 Test      \n"
             f"Max DD $       {v_dd_d} \u2502 {t_dd_d}\n"
             f"Max DD %       {v_dd_p} \u2502 {t_dd_p}\n"
             f"Loss streak    {v_ls} \u2502 {t_ls}\n"
             f"Win streak     {v_ws} \u2502 {t_ws}\n"
             f"Profit factor  {v_pf} \u2502 {t_pf}\n"
             f"Sharpe         {v_sh} \u2502 {t_sh}\n"
-            f"WF worst DD    {wf_d} ({wf_p}) streak {wf_ls}"
+            f"WF DD $        {wf_d} \u2502 {_blank}\n"
+            f"WF DD %        {wf_p} \u2502 {_blank}\n"
+            f"WF loss strk   {wf_ls_s} \u2502 {_blank}"
             "</code>\n"
         )
     else:
@@ -1041,24 +1048,25 @@ def format_retrain_complete(meta: dict, threshold: float) -> str:
         t_sh    = _risk_sharpe(test_risk.get("sharpe", 0.0))
         wf_d    = _risk_dd_dollar(wf_dd_d)
         wf_p    = _risk_dd_pct(wf_dd_pct)
+        wf_ls_s = _risk_streak(wf_ls)
+        _blank  = " " * _RISK_VAL_W
         # Column layout (monospace):
         # "Metric         " = 15 chars (label column, ljust to longest label)
-        # val value        = 7 chars (all helpers pad to 7)
-        # " │ "            = separator (1 space each side)
-        # test value       = 7 chars
-        # │ always lands at position 15 + 7 + 1 = 23 in every row.
+        # val/test values  = fixed-width fields from helper formatters.
         risk_section = (
             "\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
             "\u2502 \u26a0\ufe0f <b>Risk</b>\n"
             "\u2502 <code>"
-            "Metric         Val     \u2502 Test   \n"
+            "Metric         Val        \u2502 Test      \n"
             f"Max DD $       {v_dd_d} \u2502 {t_dd_d}\n"
             f"Max DD %       {v_dd_p} \u2502 {t_dd_p}\n"
             f"Loss streak    {v_ls} \u2502 {t_ls}\n"
             f"Win streak     {v_ws} \u2502 {t_ws}\n"
             f"Profit factor  {v_pf} \u2502 {t_pf}\n"
             f"Sharpe         {v_sh} \u2502 {t_sh}\n"
-            f"WF worst DD    {wf_d} ({wf_p}) streak {wf_ls}"
+            f"WF DD $        {wf_d} \u2502 {_blank}\n"
+            f"WF DD %        {wf_p} \u2502 {_blank}\n"
+            f"WF loss strk   {wf_ls_s} \u2502 {_blank}"
             "</code>\n"
         )
     else:
