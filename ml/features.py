@@ -24,7 +24,7 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Feature column order — MUST match exactly (32 features)
+# Feature column order — MUST match exactly (36 features)
 # ---------------------------------------------------------------------------
 FEATURE_COLS = [
     "body_ratio_n1", "body_ratio_n2", "body_ratio_n3",
@@ -120,7 +120,7 @@ def build_features(
     df1h: pd.DataFrame,
     funding: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Build 32 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'."""
+    """Build 36 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'."""
 
     # Work on copies with clean RangeIndex
     df5 = df5.copy().reset_index(drop=True)
@@ -371,10 +371,10 @@ def build_live_features(
     funding_buffer: deque,
 ) -> "tuple[np.ndarray, list[str]] | tuple[None, list[str]]":
     """
-    Build a single feature row (shape 1×32) for live inference.
+    Build a single feature row (shape 1×36) for live inference.
 
     Returns a 2-tuple (feature_row, nan_features):
-      - feature_row : np.ndarray shape (1, 32), or None on hard failure.
+      - feature_row : np.ndarray shape (1, 36), or None on hard failure.
       - nan_features: list of feature names that were NaN (empty on success).
                       Populated even when feature_row is None so callers can
                       log exactly which features caused the skip.
@@ -385,6 +385,11 @@ def build_live_features(
     """
     # Validate ATR warmup
     if len(df5_live) < 14:
+        log.debug(
+            "build_live_features: insufficient candles for ATR warmup "
+            "(have %d, need 14) — skipping inference",
+            len(df5_live),
+        )
         return None, []
 
     df5 = df5_live.copy().reset_index(drop=True)
@@ -397,6 +402,11 @@ def build_live_features(
 
     atr5 = compute_atr14(df5)
     if atr5.iloc[-1] is None or pd.isna(atr5.iloc[-1]):
+        log.warning(
+            "build_live_features: ATR is NaN at current candle "
+            "(insufficient warmup data, have %d candles) — skipping inference",
+            len(df5),
+        )
         return None, []
 
     # 5m features using last row (index -1 = current candle N)
@@ -406,6 +416,12 @@ def build_live_features(
         return series.iloc[idx] if idx >= 0 else np.nan
 
     atr5_val = safe(atr5, 1)
+    if pd.isna(atr5_val) or atr5_val <= 0:
+        log.warning(
+            "build_live_features: atr5_val is NaN or zero (%.6g) at N-1 — skipping inference",
+            atr5_val if not pd.isna(atr5_val) else float("nan"),
+        )
+        return None, []
 
     body_ratio_n1 = (safe(df5["close"], 1) - safe(df5["open"], 1)) / atr5_val
     body_ratio_n2 = (safe(df5["close"], 2) - safe(df5["open"], 2)) / safe(atr5, 2)

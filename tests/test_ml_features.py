@@ -397,3 +397,282 @@ def test_volume_ratio_n1_excludes_self_from_mean():
     assert abs(train_ratio_last - live_ratio) < 1e-10, (
         f"Train/live volume_ratio_n1 mismatch: train={train_ratio_last:.8f} live={live_ratio:.8f}"
     )
+
+
+# ===========================================================================
+# Targeted numerical parity tests for the 4 new structure features
+# Each test computes the expected value from first principles and verifies
+# that both build_features() (training) and build_live_features() (inference)
+# produce the same result to floating-point precision.
+# ===========================================================================
+
+def make_aligned_data(n=500, seed=99):
+    """Return (df5, df15, df1h, funding, funding_buf, funding_rate) with n 5m candles."""
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
+    close = 50000 + np.cumsum(rng.normal(0, 20, n))
+    open_ = close + rng.normal(0, 5, n)
+    high  = np.maximum(open_, close) + rng.uniform(0, 8, n)
+    low   = np.minimum(open_, close) - rng.uniform(0, 8, n)
+    vol   = rng.uniform(50, 200, n)
+    df5 = pd.DataFrame({"timestamp": ts, "open": open_, "high": high,
+                        "low": low, "close": close, "volume": vol})
+    s = df5.set_index("timestamp")
+    df15 = s.resample("15min").agg({"open":"first","high":"max","low":"min",
+                                    "close":"last","volume":"sum"}).dropna().reset_index()
+    df1h = s.resample("1h").agg({"open":"first","high":"max","low":"min",
+                                  "close":"last","volume":"sum"}).dropna().reset_index()
+    fts = pd.date_range(ts.min()-pd.Timedelta("16h"), ts.max()+pd.Timedelta("1h"),
+                        freq="8h", tz="UTC")
+    funding = pd.DataFrame({"timestamp": fts,
+                             "funding_rate": rng.normal(0, 0.0001, len(fts))})
+    from collections import deque
+    funding_buf = deque(rng.normal(0, 0.0001, 24).tolist(), maxlen=24)
+    funding_rate = float(rng.normal(0, 0.0001))
+    return df5, df15, df1h, funding, funding_buf, funding_rate
+
+
+def test_mtf_alignment_parity():
+    """mtf_alignment = sign(body_ratio_n1) * dir_15m * dir_1h.
+    Training: uses already-computed body_ratio_n1, dir_15m, dir_1h columns.
+    Live:     same formula on scalar values.
+    Both must equal the hand-computed reference AND each other.
+    """
+    from collections import deque
+    from ml.features import build_features, build_live_features, FEATURE_COLS
+
+    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=11)
+
+    train_feat = build_features(df5, df15, df1h, funding)
+    live_row, nan_feats = build_live_features(
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+
+    assert live_row is not None, f"live returned None; nan={nan_feats}"
+
+    idx = FEATURE_COLS.index("mtf_alignment")
+    train_val = float(train_feat["mtf_alignment"].iloc[-2])
+    live_val  = float(live_row[0][idx])
+
+    # Verify value is in {-1, 0, 1}
+    assert train_val in (-1.0, 0.0, 1.0), f"train mtf_alignment={train_val} not in {{-1,0,1}}"
+    assert live_val  in (-1.0, 0.0, 1.0), f"live  mtf_alignment={live_val}  not in {{-1,0,1}}"
+
+    # Training and live must match
+    np.testing.assert_allclose(live_val, train_val, atol=1e-12,
+        err_msg=f"mtf_alignment mismatch: train={train_val} live={live_val}")
+
+    # Hand-verify: sign(body_ratio_n1) * dir_15m * dir_1h
+    br_n1  = float(train_feat["body_ratio_n1"].iloc[-2])
+    dir15  = float(train_feat["dir_15m"].iloc[-2])
+    dir1h  = float(train_feat["dir_1h"].iloc[-2])
+    ref = np.sign(br_n1) * dir15 * dir1h
+    np.testing.assert_allclose(train_val, ref, atol=1e-12,
+        err_msg=f"mtf_alignment hand-ref mismatch: computed={train_val} ref={ref}")
+
+
+def test_body_vs_range5_parity():
+    """body_vs_range5 = |body_n1| / 5-bar range ending at N-1.
+    Window: max(high[i-1..i-5]) - min(low[i-1..i-5]).
+    Both training and live must equal the hand-computed reference.
+    """
+    from collections import deque
+    from ml.features import build_features, build_live_features, FEATURE_COLS
+
+    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=22)
+
+    train_feat = build_features(df5, df15, df1h, funding)
+    live_row, nan_feats = build_live_features(
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+
+    assert live_row is not None, f"live returned None; nan={nan_feats}"
+
+    idx = FEATURE_COLS.index("body_vs_range5")
+    train_val = float(train_feat["body_vs_range5"].iloc[-2])
+    live_val  = float(live_row[0][idx])
+
+    # Hand-compute reference at last training row (corresponds to df5 row n-2
+    # when the last df5 row is the in-progress candle that gets dropped live).
+    # training row iloc[-2] corresponds to df5 index n-2 (0-based),
+    # so N-1 in training terms = df5.iloc[-3] (the closed candle before the last).
+    n = len(df5)
+    # The last training row uses shift(1), so "N-1 candle" for that row = df5.iloc[n-2]
+    # (training iterates through all rows; last non-NaN row = row n-2 after dropna on target).
+    # We need the row index in df5 that corresponds to train_feat.iloc[-2].
+    # Easiest: verify training vs live match, then spot-check the formula.
+    np.testing.assert_allclose(live_val, train_val, atol=1e-12,
+        err_msg=f"body_vs_range5 mismatch: train={train_val} live={live_val}")
+
+    # Formula spot-check — mirror the implementation exactly.
+    # build_live_features receives df5.iloc[:-1] (499 rows, no in-progress candle),
+    # then internally does df5 = df5_live.copy().reset_index(drop=True).
+    # high_arr = df5["high"].values on that 499-row df.
+    # _n5_high = high_arr[-6:-1] = last 5 closed candles ending at N-1 (iloc[-2]).
+    df5_live_ref = df5.iloc[:-1].copy().reset_index(drop=True)
+    H_ref = df5_live_ref["high"].values
+    L_ref = df5_live_ref["low"].values
+    C_ref = df5_live_ref["close"].values
+    O_ref = df5_live_ref["open"].values
+    _n5_high_ref = H_ref[max(0, len(H_ref)-6):-1]
+    _n5_low_ref  = L_ref[max(0, len(L_ref)-6):-1]
+    _5bar_range_ref = max(float(np.max(_n5_high_ref)) - float(np.min(_n5_low_ref)), 1e-9)
+    _body_n1_abs_ref = abs(float(C_ref[-2]) - float(O_ref[-2]))
+    ref = _body_n1_abs_ref / _5bar_range_ref
+    np.testing.assert_allclose(live_val, ref, atol=1e-9,
+        err_msg=f"body_vs_range5 formula mismatch: live={live_val} ref={ref}")
+
+    # Value must be >= 0
+    assert train_val >= 0, f"body_vs_range5 negative: {train_val}"
+
+
+def test_range_expansion_parity():
+    """range_expansion = current-5-bar-range / prior-5-bar-range (6..10 candles back).
+    Training: shift(1).rolling(5) vs shift(6).rolling(5).
+    Live:     high/low[-6:-1] vs high/low[-11:-6].
+    Both must equal each other to floating-point precision.
+    """
+    from collections import deque
+    from ml.features import build_features, build_live_features, FEATURE_COLS
+
+    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=33)
+
+    train_feat = build_features(df5, df15, df1h, funding)
+    live_row, nan_feats = build_live_features(
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+
+    assert live_row is not None, f"live returned None; nan={nan_feats}"
+
+    idx = FEATURE_COLS.index("range_expansion")
+    train_val = float(train_feat["range_expansion"].iloc[-2])
+    live_val  = float(live_row[0][idx])
+
+    np.testing.assert_allclose(live_val, train_val, atol=1e-12,
+        err_msg=f"range_expansion mismatch: train={train_val} live={live_val}")
+
+    # Value must be > 0 (ratio of two positive ranges)
+    assert train_val > 0, f"range_expansion non-positive: {train_val}"
+
+    # Spot-check: current / prior must both be finite
+    assert np.isfinite(train_val), f"range_expansion not finite: {train_val}"
+
+    # Formula spot-check — mirror the implementation exactly.
+    # build_live_features receives df5.iloc[:-1] (499 rows).
+    # high_arr = those 499 rows; current=[-6:-1], prior=[-11:-6].
+    df5_live_ref = df5.iloc[:-1].copy().reset_index(drop=True)
+    H_ref = df5_live_ref["high"].values
+    L_ref = df5_live_ref["low"].values
+    _n5_hi_ref = H_ref[max(0, len(H_ref)-6):-1]
+    _n5_lo_ref = L_ref[max(0, len(L_ref)-6):-1]
+    _pr_hi_ref = H_ref[max(0, len(H_ref)-11):-6]
+    _pr_lo_ref = L_ref[max(0, len(L_ref)-11):-6]
+    cur_rng = max(float(np.max(_n5_hi_ref) - np.min(_n5_lo_ref)), 1e-9)
+    pri_rng = max(float(np.max(_pr_hi_ref) - np.min(_pr_lo_ref)), 1e-9)
+    ref = cur_rng / pri_rng
+    np.testing.assert_allclose(live_val, ref, atol=1e-9,
+        err_msg=f"range_expansion formula mismatch: live={live_val} ref={ref}")
+
+
+def test_vwap_dist_20_parity():
+    """vwap_dist_20 = (close_n1 - vwap_20) / atr5_n1.
+    vwap_20 = sum(close*vol, last 20 candles) / sum(vol, last 20 candles).
+    Training: shift(1) rolling sums; Live: array slices.
+    Both must equal each other and the hand-computed reference.
+    """
+    from collections import deque
+    from ml.features import build_features, build_live_features, FEATURE_COLS, compute_atr14
+
+    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=44)
+
+    train_feat = build_features(df5, df15, df1h, funding)
+    live_row, nan_feats = build_live_features(
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+
+    assert live_row is not None, f"live returned None; nan={nan_feats}"
+
+    idx = FEATURE_COLS.index("vwap_dist_20")
+    train_val = float(train_feat["vwap_dist_20"].iloc[-2])
+    live_val  = float(live_row[0][idx])
+
+    np.testing.assert_allclose(live_val, train_val, atol=1e-9,
+        err_msg=f"vwap_dist_20 mismatch: train={train_val} live={live_val}")
+
+    # Value must be finite (guarded by atr clip lower=1e-9)
+    assert np.isfinite(train_val), f"vwap_dist_20 not finite: {train_val}"
+
+    # Hand-compute reference — mirror the implementation exactly.
+    # build_live_features receives df5.iloc[:-1] (499 rows, no in-progress candle).
+    # Internally: df5 = df5_live.copy().reset_index(drop=True) (499 rows).
+    # atr5_val = atr5.iloc[-2] (safe(atr5,1) on 499-row df = second-to-last).
+    # VWAP window: cv_arr[-21:-1] on 499-row df = 20 values ending at N-1 (iloc[-2]).
+    # close_n1 = df5["close"].iloc[-2] on 499-row df.
+    df5_live_ref = df5.iloc[:-1].copy().reset_index(drop=True)
+    atr5_ref = compute_atr14(df5_live_ref)
+    atr_n1_ref = float(atr5_ref.iloc[-2])  # safe(atr5, 1) = iloc[-2] of 499-row df
+    cv_ref = (df5_live_ref["close"] * df5_live_ref["volume"]).values
+    v_ref  = df5_live_ref["volume"].values
+    _cv_win_ref = cv_ref[max(0, len(cv_ref)-21):-1]
+    _v_win_ref  = v_ref[max(0, len(v_ref)-21):-1]
+    vwap20_ref  = float(np.sum(_cv_win_ref)) / max(float(np.sum(_v_win_ref)), 1e-9)
+    close_n1_ref = float(df5_live_ref["close"].iloc[-2])
+    ref = (close_n1_ref - vwap20_ref) / max(atr_n1_ref, 1e-9)
+    np.testing.assert_allclose(live_val, ref, atol=1e-9,
+        err_msg=f"vwap_dist_20 formula mismatch: live={live_val} ref={ref}")
+
+
+def test_structure_features_no_nan_in_normal_conditions():
+    """All 4 structure features must be non-NaN when data is plentiful and well-formed."""
+    from collections import deque
+    from ml.features import build_features, build_live_features, FEATURE_COLS
+
+    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(n=500, seed=55)
+    train_feat = build_features(df5, df15, df1h, funding)
+
+    struct_feats = ["mtf_alignment", "body_vs_range5", "range_expansion", "vwap_dist_20"]
+    for feat in struct_feats:
+        nan_count = train_feat[feat].isna().sum()
+        total = len(train_feat)
+        # Allow up to 2% NaN for warmup rows only
+        assert nan_count / total < 0.02, \
+            f"{feat}: {nan_count}/{total} NaN rows ({nan_count/total:.1%}) — exceeds 2% warmup allowance"
+
+    live_row, nan_feats = build_live_features(
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+    assert live_row is not None, f"live returned None; nan={nan_feats}"
+    for feat in struct_feats:
+        i = FEATURE_COLS.index(feat)
+        assert not np.isnan(live_row[0][i]), f"{feat} is NaN in live row with 500 candles"
+
+
+def test_mtf_alignment_all_timeframes_aligned():
+    """When all 3 TFs are bullish, mtf_alignment must be +1.0 exactly."""
+    from collections import deque
+    from ml.features import build_features, build_live_features, FEATURE_COLS
+
+    # Build data where N-1 candle is strongly bullish on all TFs
+    rng = np.random.default_rng(77)
+    n = 500
+    ts = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
+    # Strongly trending up
+    close = 50000 + np.cumsum(np.abs(rng.normal(10, 2, n)))
+    open_ = close - np.abs(rng.normal(5, 1, n))  # always close > open (bullish)
+    high  = close + rng.uniform(1, 3, n)
+    low   = open_ - rng.uniform(1, 3, n)
+    vol   = rng.uniform(50, 200, n)
+    df5 = pd.DataFrame({"timestamp": ts, "open": open_, "high": high,
+                        "low": low, "close": close, "volume": vol})
+    s = df5.set_index("timestamp")
+    df15 = s.resample("15min").agg({"open":"first","high":"max","low":"min",
+                                    "close":"last","volume":"sum"}).dropna().reset_index()
+    df1h = s.resample("1h").agg({"open":"first","high":"max","low":"min",
+                                  "close":"last","volume":"sum"}).dropna().reset_index()
+    fts = pd.date_range(ts.min()-pd.Timedelta("16h"), ts.max()+pd.Timedelta("1h"),
+                        freq="8h", tz="UTC")
+    funding = pd.DataFrame({"timestamp": fts,
+                             "funding_rate": rng.normal(0, 0.0001, len(fts))})
+    fbuf = deque(rng.normal(0, 0.0001, 24).tolist(), maxlen=24)
+    fr = float(rng.normal(0, 0.0001))
+
+    train_feat = build_features(df5, df15, df1h, funding)
+    # In a strongly bullish series, the last few rows should all be +1
+    last_rows = train_feat["mtf_alignment"].dropna().tail(10)
+    assert (last_rows == 1.0).all(), \
+        f"Expected all +1 mtf_alignment in strongly bullish series, got: {last_rows.values}"
