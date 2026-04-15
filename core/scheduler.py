@@ -725,6 +725,76 @@ async def recover_unresolved() -> None:
         )
 
 
+async def _feature_drift_check_job() -> None:
+    """Daily feature drift monitoring -- compares recent inference feature means
+    to training distribution. Sends Telegram alert if drift is detected."""
+    from ml.evaluator import check_feature_drift
+    from ml import model_store, inference_logger
+
+    log.info("feature_drift_check: starting daily drift check")
+
+    meta = model_store.load_metadata("current")
+    if meta is None:
+        log.warning("feature_drift_check: no model metadata found -- skipping")
+        return
+
+    training_stats = meta.get("training_feature_stats")
+    if not training_stats:
+        log.warning(
+            "feature_drift_check: no training_feature_stats in metadata -- "
+            "skipping (retrain to enable drift monitoring)"
+        )
+        return
+
+    log_path = inference_logger.get_log_path()
+    if not log_path:
+        log.warning("feature_drift_check: inference log path not configured -- skipping")
+        return
+
+    result = check_feature_drift(
+        inference_log_path=log_path,
+        training_feature_stats=training_stats,
+        n_recent=500,
+        z_threshold=2.0,
+    )
+
+    if result.get("error"):
+        log.warning("feature_drift_check: check returned error: %s", result["error"])
+        return
+
+    n = result["records_analyzed"]
+    drifted = result["drifted_features"]
+
+    if not drifted:
+        log.info("feature_drift_check: no drift detected (%d records analyzed)", n)
+        return
+
+    # Build alert message
+    drift_lines = []
+    for d in drifted[:10]:
+        drift_lines.append(
+            f"  <b>{d['feature']}</b>: live={d['live_mean']:.4f} "
+            f"train={d['train_mean']:.4f} z={d['z_score']:+.2f}"
+        )
+
+    msg = (
+        f"\u26a0\ufe0f <b>Feature Drift Detected</b>\n"
+        f"\u2500" * 20 + "\n"
+        f"\U0001f4ca Records analyzed: {n}\n"
+        f"\u26a0\ufe0f Drifted features ({len(drifted)}):\n"
+        + "\n".join(drift_lines) + "\n"
+        + "\u2500" * 20 + "\n"
+        f"\U0001f916 Model may be operating on out-of-distribution data.\n"
+        f"Consider retraining with /retrain."
+    )
+
+    await _send_telegram(msg)
+    log.warning(
+        "feature_drift_check: drift alert sent -- %d features drifted: %s",
+        len(drifted), [d["feature"] for d in drifted],
+    )
+
+
 def start_scheduler(tg_app, poly_client) -> AsyncIOScheduler:
     """Create, configure, and start the scheduler."""
     global SCHEDULER, _tg_app, _poly_client
@@ -757,6 +827,18 @@ def start_scheduler(tg_app, poly_client) -> AsyncIOScheduler:
 
     # Schedule first signal check
     _schedule_next()
+
+    # Daily feature drift monitoring at 06:00 UTC
+    SCHEDULER.add_job(
+        _feature_drift_check_job,
+        trigger="cron",
+        hour=6,
+        minute=0,
+        timezone="UTC",
+        id="feature_drift_check",
+        replace_existing=True,
+    )
+    log.info("Feature drift check job scheduled (daily at 06:00 UTC).")
 
     log.info("Scheduler started.")
     return SCHEDULER

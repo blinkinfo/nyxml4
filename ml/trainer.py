@@ -104,12 +104,21 @@ def sweep_threshold(
     y_true: np.ndarray,
     lo: float = 0.50,
     hi: float = 0.80,
-    step: float = 0.02,
+    step_coarse: float = 0.02,
     payout: float = ML_PAYOUT_RATIO,
 ) -> tuple[float, float, float]:
-    """Sweep thresholds on val set and select best.
+    """Two-stage threshold sweep: coarse pass finds the neighbourhood,
+    fine pass (step=0.005) within +/-0.02 of the coarse best finds the true optimum.
 
-    Selection criteria:
+    Stage 1: step=0.02 across [lo, hi] -- 16 candidates, finds the best region.
+    Stage 2: step=0.005 within [best_coarse - 0.02, best_coarse + 0.02] --
+             ~8 fine candidates, finds the true optimum without overfitting across
+             the full range.
+
+    This avoids the overfitting problem of 61 fine candidates across the full range
+    while still finding the true optimum more precisely than a single coarse step.
+
+    Selection criteria (applied in both stages):
       - Thresholds with fewer than MIN_TRADES trades are skipped -- the WR
         estimate is too noisy to be meaningful on small samples.
       - If any remaining threshold achieves WR >= 0.58: pick the one that
@@ -127,17 +136,12 @@ def sweep_threshold(
       uses actual dollar EV so the selected threshold always maximises
       real daily profit.
 
-    Step is intentionally coarse (0.02) to reduce overfitting on small val
-    slices.  Fine steps (e.g. 0.005) produce 61 candidates on a small slice
-    and reliably find a lucky threshold; 0.02 gives 16 candidates while still
-    covering the full 0.50-0.80 range.
-
     Args:
         probs: Model output probabilities for the validation set.
         y_true: True binary labels for the validation set.
         lo: Lower bound of threshold sweep range.
         hi: Upper bound of threshold sweep range.
-        step: Step size for sweep (coarse by design).
+        step_coarse: Step size for coarse sweep (default 0.02).
         payout: Profit per $1 wagered on a win (default: ML_PAYOUT_RATIO
                 from config, overridable via ML_PAYOUT_RATIO env var).
 
@@ -145,68 +149,81 @@ def sweep_threshold(
       (best_threshold, best_wr, trades_per_day)
       trades_per_day = trades / (len(probs) * 5 / 1440)
     """
-    best_threshold = lo
-    best_wr = 0.0
-    best_trades = 0
-    best_trades_per_day = 0.0
-
-    # First pass: collect candidates with WR >= 0.58 AND trades >= MIN_TRADES
-    candidates_above = []
-
-    thresh = lo
-    while thresh <= hi + 1e-9:
-        mask = probs >= thresh
-        trades = int(mask.sum())
-        if trades >= MIN_TRADES:
-            wr = float(y_true[mask].mean())
-            tpd = trades / (len(probs) * 5 / 1440)
-            if wr >= 0.58:
-                candidates_above.append((thresh, wr, trades, tpd))
-        thresh = round(thresh + step, 4)
-
-    if candidates_above:
-        # Pick the threshold with the highest payout-adjusted EV/day.
-        # EV/day = (WR * (1 + payout) - 1.0) * trades_per_day
-        # This correctly accounts for asymmetric win/loss payouts and ranks
-        # thresholds by real dollar profitability.
-        # Example at payout=0.85:
-        #   thresh=0.60: WR=64%, tpd=56  -> EV/day = (0.64*1.85-1.0)*56 = 0.184*56 = 10.30
-        #   thresh=0.53: WR=58.2%, tpd=122 -> EV/day = (0.582*1.85-1.0)*122 = 0.077*122 = 9.36
-        #   -> thresh=0.60 wins (correctly -- it earns more dollars per day)
-        best = max(candidates_above, key=lambda x: _ev_per_day(x[1], x[3], payout))
-        best_threshold, best_wr, best_trades, best_trades_per_day = best
-        log.info(
-            "sweep_threshold: WR>=0.58 candidates=%d, payout=%.2f, "
-            "best thresh=%.3f WR=%.4f trades/day=%.1f ev/day=%.4f",
-            len(candidates_above), payout,
-            best_threshold, best_wr, best_trades_per_day,
-            _ev_per_day(best_wr, best_trades_per_day, payout),
-        )
-    else:
-        # No candidate >= 0.58 with enough trades: fall back to the threshold
-        # with the highest payout-adjusted EV/day among those >= MIN_TRADES.
-        # More correct than raw max-WR since it accounts for the real payout.
-        best_ev = float("-inf")
-        thresh = lo
-        while thresh <= hi + 1e-9:
-            mask = probs >= thresh
+    def _run_sweep(lo_s: float, hi_s: float, step_s: float):
+        """Run a single-pass sweep, return (candidates_above, all_candidates)."""
+        _above = []
+        _all = []
+        t = lo_s
+        while t <= hi_s + 1e-9:
+            mask = probs >= t
             trades = int(mask.sum())
             if trades >= MIN_TRADES:
                 wr = float(y_true[mask].mean())
                 tpd = trades / (len(probs) * 5 / 1440)
-                ev = _ev_per_day(wr, tpd, payout)
-                if ev > best_ev:
-                    best_ev = ev
-                    best_threshold = thresh
-                    best_wr = wr
-                    best_trades_per_day = tpd
-            thresh = round(thresh + step, 4)
+                _all.append((t, wr, trades, tpd))
+                if wr >= 0.58:
+                    _above.append((t, wr, trades, tpd))
+            t = round(t + step_s, 4)
+        return _above, _all
+
+    # ---------------------------------------------------------------------------
+    # Stage 1: coarse pass (step=step_coarse) across [lo, hi]
+    # ---------------------------------------------------------------------------
+    candidates_above_coarse, all_coarse = _run_sweep(lo, hi, step_coarse)
+
+    if candidates_above_coarse:
+        best_coarse = max(candidates_above_coarse, key=lambda x: _ev_per_day(x[1], x[3], payout))
+    elif all_coarse:
+        best_coarse = max(all_coarse, key=lambda x: _ev_per_day(x[1], x[3], payout))
+    else:
+        log.warning("sweep_threshold: no viable candidates in coarse pass — returning lo=%.3f", lo)
+        return lo, 0.0, 0.0
+
+    best_coarse_threshold = best_coarse[0]
+    log.info(
+        "sweep_threshold stage1 (coarse step=%.3f): best_coarse=%.3f WR=%.4f tpd=%.1f ev/day=%.4f",
+        step_coarse, best_coarse_threshold, best_coarse[1], best_coarse[3],
+        _ev_per_day(best_coarse[1], best_coarse[3], payout),
+    )
+
+    # ---------------------------------------------------------------------------
+    # Stage 2: fine pass (step=0.005) within [best_coarse - 0.02, best_coarse + 0.02]
+    # ---------------------------------------------------------------------------
+    fine_lo = max(lo, round(best_coarse_threshold - 0.02, 4))
+    fine_hi = min(hi, round(best_coarse_threshold + 0.02, 4))
+    candidates_above_fine, all_fine = _run_sweep(fine_lo, fine_hi, 0.005)
+
+    if candidates_above_fine:
+        best_fine = max(candidates_above_fine, key=lambda x: _ev_per_day(x[1], x[3], payout))
+    elif all_fine:
+        best_fine = max(all_fine, key=lambda x: _ev_per_day(x[1], x[3], payout))
+    else:
+        # Fine range produced no candidates — fall back to coarse best
+        best_fine = best_coarse
+
+    best_threshold, best_wr, _, best_trades_per_day = best_fine
+    log.info(
+        "sweep_threshold stage2 (fine step=0.005, range=[%.3f,%.3f]): "
+        "best=%.3f WR=%.4f tpd=%.1f ev/day=%.4f",
+        fine_lo, fine_hi, best_threshold, best_wr, best_trades_per_day,
+        _ev_per_day(best_wr, best_trades_per_day, payout),
+    )
+
+    # Log warning if no WR>=0.58 candidates were found (fallback path)
+    candidates_above = candidates_above_fine if candidates_above_fine else candidates_above_coarse
+    if not candidates_above:
         log.warning(
-            "sweep_threshold: no threshold achieves WR>=0.58 (min_trades=%d), "
-            "payout=%.2f, best=%.3f WR=%.4f ev/day=%.4f",
-            MIN_TRADES, payout, best_threshold, best_wr,
+            "sweep_threshold: no WR>=0.58 threshold found — using best EV/day fallback "
+            "thresh=%.3f WR=%.4f tpd=%.1f ev/day=%.4f",
+            best_threshold, best_wr, best_trades_per_day,
             _ev_per_day(best_wr, best_trades_per_day, payout),
         )
+    else:
+        if not candidates_above_fine:
+            log.warning(
+                "sweep_threshold: no WR>=0.58 candidates in fine range — fell back to coarse best"
+            )
+        pass  # best already set from fine/coarse pass above
 
     return best_threshold, best_wr, best_trades_per_day
 
@@ -535,12 +552,18 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
     # not from a sweep on this val set.
     #
     # Time-series split: DO NOT SHUFFLE
-    # split_boundary = index where validation ends and test begins (75% of data).
+    # split_boundary = index where validation ends and test begins (80% of data).
     # val_start      = index where training ends and validation begins (80% of split_boundary).
     # Layout: [0 : val_start] = train, [val_start : split_boundary] = val, [split_boundary :] = test
+    # 80/20 split aligns with WFV fold 5 seen data proportion.
     # ---------------------------------------------------------------------------
-    split_boundary = int(n * 0.75)
+    split_boundary = int(n * 0.80)
     val_start = int(split_boundary * 0.80)
+
+    # Compute training feature statistics for drift monitoring (stored in metadata)
+    from ml.evaluator import compute_training_feature_stats
+    _training_feature_stats = compute_training_feature_stats(X[:split_boundary], FEATURE_COLS)
+    log.info("train: computed training feature stats for %d features", len(_training_feature_stats))
 
     log.info("train: n=%d train=[0:%d] val=[%d:%d] test=[%d:%d]",
              n, val_start, val_start, split_boundary, split_boundary, n)
@@ -777,6 +800,8 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "feature_cols": FEATURE_COLS,
         "best_iteration": model.best_iteration,
         "blocked": blocked,
+        # Training feature distribution stats for drift monitoring (check_feature_drift)
+        "training_feature_stats": _training_feature_stats,
     }
     model_store.save_model(model, slot, metadata)
 

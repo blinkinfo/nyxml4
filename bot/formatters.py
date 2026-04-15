@@ -1094,3 +1094,26 @@ def format_set_down_threshold(threshold: float) -> str:
         "Active on next signal check.\n\n"
         f"Signals will only SHORT when p_down \u2265 <b>{threshold:.3f}</b>."
     )
+
+
+def format_drift_alert(drifted_features: list, records_analyzed: int) -> str:
+    """Format a feature drift alert for Telegram."""
+    lines = [
+        "\u26a0\ufe0f <b>Feature Drift Alert</b>",
+        "\u2501" * 20,
+        f"\U0001f4ca Records analyzed: {records_analyzed}",
+        f"\u26a0\ufe0f {len(drifted_features)} feature(s) drifted &gt; 2\u03c3:",
+    ]
+    for d in drifted_features[:10]:
+        z = d["z_score"]
+        sign = "+" if z >= 0 else ""
+        lines.append(
+            f"  \U0001f4cc <b>{d['feature']}</b>: "
+            f"live={d['live_mean']:.4f} vs train={d['train_mean']:.4f} "
+            f"(z={sign}{z:.2f})"
+        )
+    lines += [
+        "\u2501" * 20,
+        "\U0001f916 Model may need retraining. Use /retrain to update.",
+    ]
+    return "\n".join(lines)

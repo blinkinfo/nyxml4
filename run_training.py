@@ -2,7 +2,7 @@ import sys
 import site
 # Add user site-packages so managed service can find ccxt/lightgbm etc.
 sys.path.insert(0, site.getusersitepackages())
-sys.path.insert(0, '/home/nebula/nyxtest4')
+sys.path.insert(0, '/home/nebula/nyxml3.7')
 from ml import data_fetcher, features as feat_eng, trainer, model_store
 
 print('Fetching 5 months of MEXC data...')

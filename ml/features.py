@@ -7,8 +7,9 @@ Target semantics: 1 if the NEXT candle closes at or above its own open
 (close[i+1] >= open[i+1]), matching Polymarket's settlement logic
 (resolver.py: winner = "Up" if close_price >= open_price else "Down").
 
-26 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
-funding (2), CVD (5), time-of-day (2), volatility regime (2).
+32 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
+funding (2), CVD (5), time-of-day cyclical (4), volatility regime (2),
+momentum (4: rsi14, candle_streak, price_in_range, ema_cross_5m).
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Feature column order — MUST match exactly (26 features)
+# Feature column order — MUST match exactly (32 features)
 # ---------------------------------------------------------------------------
 FEATURE_COLS = [
     "body_ratio_n1", "body_ratio_n2", "body_ratio_n3",
@@ -33,7 +34,9 @@ FEATURE_COLS = [
     "body_ratio_1h", "dir_1h", "ema9_slope_1h",
     "funding_rate", "funding_zscore",
     "delta_ratio", "cvd_delta", "cvd_5", "cvd_20", "cvd_trend",
-    "hour_utc", "dow", "atr_percentile_24h", "vol_regime",
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos",  # cyclical time (replaces hour_utc, dow)
+    "atr_percentile_24h", "vol_regime",
+    "rsi14", "candle_streak", "price_in_range", "ema_cross_5m",  # momentum features
 ]
 
 
@@ -115,7 +118,7 @@ def build_features(
     funding: pd.DataFrame,
     cvd: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Build 26 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'."""
+    """Build 32 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'."""
 
     # Work on copies with clean RangeIndex
     df5 = df5.copy().reset_index(drop=True)
@@ -238,12 +241,17 @@ def build_features(
     df5["cvd_trend"] = rcvd["cvd_trend_raw"].shift(1).values
 
     # -----------------------------------------------------------------------
-    # Time-of-day features — derived from N-1 candle timestamp (ts_n1 = df5["timestamp"].shift(1))
-    # hour_utc: 0-23 UTC hour of the N-1 candle open
-    # dow: 0=Monday .. 6=Sunday day-of-week of the N-1 candle
+    # Time-of-day cyclical features — derived from N-1 candle timestamp
+    # Replaces raw hour_utc and dow with sine/cosine encoding so the model
+    # can learn periodic patterns without discontinuities at midnight / week-end.
+    # -----------------------------------------------------------------------
     ts_n1_series = df5["timestamp"].shift(1)
-    df5["hour_utc"] = ts_n1_series.dt.hour.astype(float)
-    df5["dow"] = ts_n1_series.dt.dayofweek.astype(float)
+    hour_raw = ts_n1_series.dt.hour
+    dow_raw = ts_n1_series.dt.dayofweek
+    df5["hour_sin"] = np.sin(2 * np.pi * hour_raw / 24)
+    df5["hour_cos"] = np.cos(2 * np.pi * hour_raw / 24)
+    df5["dow_sin"]  = np.sin(2 * np.pi * dow_raw / 7)
+    df5["dow_cos"]  = np.cos(2 * np.pi * dow_raw / 7)
 
     # Volatility regime features — derived from ATR of the N-1 candle
     # atr_percentile_24h: percentile rank (0.0–1.0) of atr5[i-1] within a 288-candle rolling window
@@ -266,6 +274,40 @@ def build_features(
     atr_roll_mean = roll.mean()
     atr_roll_std  = roll.std()
     df5["vol_regime"] = (atr_shifted - atr_roll_mean) / atr_roll_std.clip(lower=1e-10)
+
+    # -----------------------------------------------------------------------
+    # Momentum features (new) — all use shift(k>=1) for zero lookahead
+    # -----------------------------------------------------------------------
+
+    # rsi14: Wilder's RSI(14) on 5m closes, N-1 value
+    _delta = df5["close"].diff()
+    _gain = _delta.clip(lower=0)
+    _loss = (-_delta).clip(lower=0)
+    _avg_gain = _gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    _avg_loss = _loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    _rs = _avg_gain / _avg_loss.clip(lower=1e-10)
+    _rsi = 100.0 - (100.0 / (1.0 + _rs))
+    df5["rsi14"] = _rsi.shift(1)  # N-1 value, zero lookahead
+
+    # candle_streak: consecutive same-direction candles ending at N-1
+    # Vectorized approach: group consecutive same-direction runs
+    _direction = np.sign(df5["close"] - df5["open"])
+    _same_as_prev = (_direction == _direction.shift(1)) & (_direction != 0)
+    _streak = _same_as_prev.groupby((~_same_as_prev).cumsum()).cumsum()
+    _streak = _streak.where(_direction != 0, 0).astype(float)
+    df5["candle_streak"] = _streak.shift(1)  # N-1 value
+
+    # price_in_range: where N-1 close sits within 20-candle range ending at N-1
+    # rolling(20).max/min on shift(1) gives range of [i-20..i-1] — zero lookahead
+    _rolling_high = df5["high"].shift(1).rolling(20, min_periods=5).max()
+    _rolling_low  = df5["low"].shift(1).rolling(20, min_periods=5).min()
+    _rng = (_rolling_high - _rolling_low).clip(lower=1e-10)
+    df5["price_in_range"] = (df5["close"].shift(1) - _rolling_low) / _rng
+
+    # ema_cross_5m: sign of EMA9 vs EMA21 at N-1 candle (-1, 0, +1)
+    _ema9_5m  = df5["close"].ewm(span=9,  adjust=False).mean()
+    _ema21_5m = df5["close"].ewm(span=21, adjust=False).mean()
+    df5["ema_cross_5m"] = np.sign(_ema9_5m - _ema21_5m).shift(1)  # N-1 cross state
 
     # -----------------------------------------------------------------------
     # Target: 1 if next candle closes >= its own open (future label, NOT a feature)
@@ -296,10 +338,10 @@ def build_live_features(
     cvd_live: pd.DataFrame,
 ) -> "tuple[np.ndarray, list[str]] | tuple[None, list[str]]":
     """
-    Build a single feature row (shape 1×26) for live inference.
+    Build a single feature row (shape 1×32) for live inference.
 
     Returns a 2-tuple (feature_row, nan_features):
-      - feature_row : np.ndarray shape (1, 26), or None on hard failure.
+      - feature_row : np.ndarray shape (1, 32), or None on hard failure.
       - nan_features: list of feature names that were NaN (empty on success).
                       Populated even when feature_row is None so callers can
                       log exactly which features caused the skip.
@@ -478,14 +520,21 @@ def build_live_features(
     else:
         delta_ratio = cvd_delta = cvd_5 = cvd_20 = cvd_trend = np.nan
 
-    # Time-of-day features — use N-1 candle timestamp (index -2)
+    # -----------------------------------------------------------------------
+    # Time-of-day cyclical features — use N-1 candle timestamp (index -2)
+    # Replaces raw hour_utc and dow with sin/cos encoding.
+    # -----------------------------------------------------------------------
     ts_n1_live = df5["timestamp"].iloc[-2] if len(df5) >= 2 else None
     if ts_n1_live is not None and not pd.isna(ts_n1_live):
-        hour_utc = float(pd.Timestamp(ts_n1_live).hour)
-        dow = float(pd.Timestamp(ts_n1_live).dayofweek)
+        ts = pd.Timestamp(ts_n1_live)
+        hour_raw_live = float(ts.hour)
+        dow_raw_live  = float(ts.dayofweek)
+        hour_sin = float(np.sin(2 * np.pi * hour_raw_live / 24))
+        hour_cos = float(np.cos(2 * np.pi * hour_raw_live / 24))
+        dow_sin  = float(np.sin(2 * np.pi * dow_raw_live / 7))
+        dow_cos  = float(np.cos(2 * np.pi * dow_raw_live / 7))
     else:
-        hour_utc = np.nan
-        dow = np.nan
+        hour_sin = hour_cos = dow_sin = dow_cos = np.nan
 
     # Volatility regime features — rolling window on atr5 series
     _ATR_WINDOW = 288
@@ -518,6 +567,72 @@ def build_live_features(
         atr_percentile_24h = np.nan
         vol_regime = np.nan
 
+    # -----------------------------------------------------------------------
+    # Momentum features (live) — zero lookahead, all use N-1 values
+    # -----------------------------------------------------------------------
+
+    # rsi14 (live): Wilder's RSI(14) on 5m closes at N-1
+    if len(df5) >= 15:
+        delta_live = df5["close"].diff()
+        gain_live  = delta_live.clip(lower=0)
+        loss_live  = (-delta_live).clip(lower=0)
+        avg_gain_live = gain_live.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        avg_loss_live = loss_live.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        rs_live  = avg_gain_live / avg_loss_live.clip(lower=1e-10)
+        rsi_live = 100.0 - (100.0 / (1.0 + rs_live))
+        rsi14 = float(rsi_live.iloc[-2])  # N-1 value
+        if np.isnan(rsi14):
+            rsi14 = np.nan
+    else:
+        rsi14 = np.nan
+
+    # candle_streak (live): consecutive same-direction candles ending at N-1
+    if len(df5) >= 2:
+        dir_live = np.sign(df5["close"].values - df5["open"].values)
+        # Walk backwards from N-1 (index -2) counting same direction
+        streak_val = 0.0
+        ref_dir = dir_live[-2]  # N-1 direction
+        if ref_dir != 0:
+            streak_val = 1.0
+            for k in range(3, len(dir_live) + 1):
+                if dir_live[-k] == ref_dir:
+                    streak_val += 1.0
+                else:
+                    break
+        candle_streak = streak_val
+    else:
+        candle_streak = np.nan
+
+    # price_in_range (live): where N-1 close sits within 20-candle range ending at N-1
+    if len(df5) >= 6:
+        high_arr = df5["high"].values
+        low_arr  = df5["low"].values
+        close_arr = df5["close"].values
+        # N-1 close: index -2
+        # 20-candle range ending at N-1 (inclusive): high/low of [-21:-1] or available
+        window_hi = high_arr[max(0, len(high_arr)-21):-1]
+        window_lo = low_arr[max(0, len(low_arr)-21):-1]
+        if len(window_hi) >= 5:
+            rng_hi = float(np.max(window_hi))
+            rng_lo = float(np.min(window_lo))
+            rng = max(rng_hi - rng_lo, 1e-10)
+            price_in_range = (close_arr[-2] - rng_lo) / rng
+        else:
+            price_in_range = np.nan
+    else:
+        price_in_range = np.nan
+
+    # ema_cross_5m (live): sign of EMA9 vs EMA21 at N-1
+    if len(df5) >= 22:
+        ema9_live  = df5["close"].ewm(span=9,  adjust=False).mean()
+        ema21_live = df5["close"].ewm(span=21, adjust=False).mean()
+        ema_cross_5m = float(np.sign(ema9_live.iloc[-2] - ema21_live.iloc[-2]))  # N-1
+    else:
+        ema_cross_5m = np.nan
+
+    # -----------------------------------------------------------------------
+    # Assemble final row — order MUST match FEATURE_COLS exactly (32 features)
+    # -----------------------------------------------------------------------
     row = np.array([[
         body_ratio_n1, body_ratio_n2, body_ratio_n3,
         upper_wick_n1, upper_wick_n2,
@@ -527,7 +642,9 @@ def build_live_features(
         body_ratio_1h, dir_1h, ema9_slope_1h,
         fr, funding_zscore,
         delta_ratio, cvd_delta, cvd_5, cvd_20, cvd_trend,
-        hour_utc, dow, atr_percentile_24h, vol_regime,
+        hour_sin, hour_cos, dow_sin, dow_cos,
+        atr_percentile_24h, vol_regime,
+        rsi14, candle_streak, price_in_range, ema_cross_5m,
     ]], dtype=np.float64)
 
     nan_features = [FEATURE_COLS[i] for i in range(len(FEATURE_COLS)) if np.isnan(row[0][i])]

@@ -265,3 +265,166 @@ def _print_table(m: dict) -> None:
             print(f"    TN={cm[0][0]}  FP={cm[0][1]}")
             print(f"    FN={cm[1][0]}  TP={cm[1][1]}")
     print("=" * 52 + "\n")
+
+
+def compute_training_feature_stats(X: "np.ndarray", feature_names: "list[str]") -> dict:
+    """Compute mean and std of each feature from the training dataset.
+
+    Returns dict mapping feature_name -> {"mean": float, "std": float}.
+    Used by check_feature_drift() to detect covariate shift at inference time.
+    """
+    stats = {}
+    for i, fname in enumerate(feature_names):
+        col = X[:, i]
+        col = col[~np.isnan(col)]
+        if len(col) >= 2:
+            stats[fname] = {
+                "mean": float(np.mean(col)),
+                "std": float(np.std(col, ddof=1)),
+            }
+    return stats
+
+
+def check_feature_drift(
+    inference_log_path: str,
+    training_feature_stats: dict,
+    n_recent: int = 500,
+    z_threshold: float = 2.0,
+) -> dict:
+    """Check for feature drift between recent inference data and training distribution.
+
+    Loads the last n_recent inference log records, computes the mean of each feature,
+    and flags features whose mean deviates more than z_threshold standard deviations
+    from the training distribution mean.
+
+    Args:
+        inference_log_path: Path to the JSONL inference log file.
+        training_feature_stats: Dict mapping feature_name -> {"mean": float, "std": float}
+                                 from the training dataset. Stored in model metadata.
+        n_recent: Number of recent inference records to analyze (default 500 = ~42 hours).
+        z_threshold: Z-score threshold for flagging drift (default 2.0 sigma).
+
+    Returns:
+        dict with keys:
+            "records_analyzed": int
+            "drifted_features": list[dict]  -- each has feature, live_mean, train_mean, train_std, z_score
+            "ok": bool -- True if no features drifted beyond threshold
+            "checked_at": str -- ISO UTC timestamp
+            "error": str | None
+    """
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from collections import defaultdict
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+
+    if not inference_log_path or not Path(inference_log_path).exists():
+        log.warning("check_feature_drift: log file not found at %s", inference_log_path)
+        return {
+            "records_analyzed": 0,
+            "drifted_features": [],
+            "ok": True,
+            "checked_at": checked_at,
+            "error": f"Log file not found: {inference_log_path}",
+        }
+
+    if not training_feature_stats:
+        log.warning("check_feature_drift: no training_feature_stats provided -- skipping")
+        return {
+            "records_analyzed": 0,
+            "drifted_features": [],
+            "ok": True,
+            "checked_at": checked_at,
+            "error": "No training feature stats provided",
+        }
+
+    try:
+        records = []
+        with open(inference_log_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    if rec.get("record_type") == "outcome_patch":
+                        continue
+                    features = rec.get("features")
+                    if features and any(v is not None for v in features.values()):
+                        records.append(features)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        records = records[-n_recent:]
+        n = len(records)
+
+        if n < 10:
+            log.warning("check_feature_drift: only %d records available (minimum 10 required)", n)
+            return {
+                "records_analyzed": n,
+                "drifted_features": [],
+                "ok": True,
+                "checked_at": checked_at,
+                "error": f"Insufficient records: {n} (minimum 10 required)",
+            }
+
+        feature_values: dict = defaultdict(list)
+        for feat_dict in records:
+            for fname, fval in feat_dict.items():
+                if fval is not None and not (isinstance(fval, float) and np.isnan(fval)):
+                    feature_values[fname].append(float(fval))
+
+        drifted = []
+        for fname, stats in training_feature_stats.items():
+            train_mean = stats.get("mean")
+            train_std = stats.get("std")
+            if train_mean is None or train_std is None or train_std <= 0:
+                continue
+            live_vals = feature_values.get(fname, [])
+            if len(live_vals) < 10:
+                continue
+            live_mean = float(np.mean(live_vals))
+            z = (live_mean - train_mean) / train_std
+            if abs(z) >= z_threshold:
+                drifted.append({
+                    "feature": fname,
+                    "live_mean": round(live_mean, 6),
+                    "train_mean": round(float(train_mean), 6),
+                    "train_std": round(float(train_std), 6),
+                    "z_score": round(z, 3),
+                })
+                log.warning(
+                    "check_feature_drift: DRIFT DETECTED feature=%s live_mean=%.4f "
+                    "train_mean=%.4f train_std=%.4f z=%.2f",
+                    fname, live_mean, train_mean, train_std, z,
+                )
+
+        if not drifted:
+            log.info(
+                "check_feature_drift: no drift detected (%d records, %d features checked)",
+                n, len(training_feature_stats),
+            )
+        else:
+            log.warning(
+                "check_feature_drift: %d feature(s) drifted beyond %.1f sigma: %s",
+                len(drifted), z_threshold, [d["feature"] for d in drifted],
+            )
+
+        return {
+            "records_analyzed": n,
+            "drifted_features": drifted,
+            "ok": len(drifted) == 0,
+            "checked_at": checked_at,
+            "error": None,
+        }
+
+    except Exception as exc:
+        log.error("check_feature_drift: unexpected error: %s", exc, exc_info=True)
+        return {
+            "records_analyzed": 0,
+            "drifted_features": [],
+            "ok": True,
+            "checked_at": checked_at,
+            "error": str(exc),
+        }
