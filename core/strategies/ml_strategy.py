@@ -345,6 +345,88 @@ class MLStrategy(BaseStrategy):
             # before Option B or failed the DOWN sweep, down_enabled=False and
             # no DOWN trade ever fires regardless of prob_down.
             down_enabled = self._get_down_enabled()
+
+            # ------------------------------------------------------------------
+            # Regime gate -- covariate shift guard (Blueprint Option 1).
+            #
+            # At training time, trainer.py records the 5th and 95th percentile
+            # of vol_regime across the full training dataset and stores them as
+            # "regime_vol_p5" / "regime_vol_p95" in the model metadata JSON.
+            #
+            # Here we compare the live vol_regime value against those bounds.
+            # If the live regime falls OUTSIDE [p5, p95], the model is operating
+            # in a volatility environment it rarely saw during training -- its
+            # probability estimates are less calibrated and the signal is suppressed.
+            #
+            # Design decisions:
+            #   - Gate fires AFTER model.predict() so the log always contains the
+            #     full p_up/p_down values. This lets you audit "what the model
+            #     wanted to do" vs "what the gate blocked" -- invaluable for tuning.
+            #   - If metadata is missing or the keys are absent (e.g. older model
+            #     trained before this feature), the gate is silently skipped.
+            #     This guarantees full backwards compatibility with no config change.
+            #   - If either bound is None (degenerate training set < 10 samples),
+            #     the gate is skipped -- not the live bot's fault, don't punish it.
+            #   - The gate itself is wrapped in try/except so a metadata read error
+            #     never crashes inference -- the model fires normally if gate errors.
+            # ------------------------------------------------------------------
+            try:
+                _meta = model_store.load_metadata(self._model_slot)
+                if _meta is not None:
+                    _regime_p5  = _meta.get("regime_vol_p5")
+                    _regime_p95 = _meta.get("regime_vol_p95")
+                    if _regime_p5 is not None and _regime_p95 is not None:
+                        _vol_regime_idx = FEATURE_COLS.index("vol_regime")
+                        _live_regime = float(feature_row[0, _vol_regime_idx])
+                        if not (_regime_p5 <= _live_regime <= _regime_p95):
+                            _regime_skip_reason = (
+                                f"Regime gate: vol_regime={_live_regime:.4f} outside training "
+                                f"distribution [{_regime_p5:.4f}, {_regime_p95:.4f}] -- "
+                                f"signal suppressed (covariate shift guard)"
+                            )
+                            log.warning("MLStrategy: %s", _regime_skip_reason)
+                            inference_logger.log_inference(
+                                slot_slug=slug,
+                                slot_ts=slot_ts,
+                                slot_start_str=slot_start_str,
+                                slot_end_str=slot_end_str,
+                                df5_rows=df5_rows,
+                                df15_rows=df15_rows,
+                                df1h_rows=df1h_rows,
+                                cvd_rows=cvd_rows,
+                                funding_buf_len=funding_buf_len,
+                                candle_n1_ts=candle_n1_ts,
+                                candle_n1_close=candle_n1_close,
+                                candle_n1_vol=candle_n1_vol,
+                                feature_names=FEATURE_COLS,
+                                feature_row=feature_row,
+                                nan_features=[],
+                                p_up=prob,
+                                p_down=prob_down,
+                                up_threshold=up_threshold,
+                                down_threshold=down_threshold,
+                                down_enabled=down_enabled,
+                                fired=False,
+                                side=None,
+                                skip_reason=_regime_skip_reason,
+                            )
+                            return {
+                                **base_fields,
+                                "pattern": f"p={prob:.4f} [regime_gate]",
+                                "reason": _regime_skip_reason,
+                                "ml_p_up":           prob,
+                                "ml_p_down":         prob_down,
+                                "ml_up_threshold":   up_threshold,
+                                "ml_down_threshold": down_threshold,
+                                "ml_down_enabled":   down_enabled,
+                            }
+            except Exception as _rge:
+                # Never let the regime gate itself crash inference.
+                # Log and continue -- the model fires normally if the gate errors.
+                log.warning(
+                    "MLStrategy: regime gate check failed (non-fatal, continuing): %s", _rge
+                )
+
             down_qualifies = down_enabled and (prob_down >= down_threshold)
 
             # Determine direction:

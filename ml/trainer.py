@@ -492,6 +492,32 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
     y = df_features["target"].values
 
     # ---------------------------------------------------------------------------
+    # Regime distribution bounds — computed from the full training set.
+    # Stored in metadata so the live inference gate can filter out candles whose
+    # vol_regime falls outside the 5th–95th percentile of the training distribution.
+    # Using the full X (not just the train split) gives the widest honest picture
+    # of what regime values the model has been exposed to across all training data.
+    # NaNs are stripped before percentile computation (warmup rows from rolling ATR).
+    # ---------------------------------------------------------------------------
+    _vol_regime_idx = FEATURE_COLS.index("vol_regime")
+    _vol_regime_vals = X[:, _vol_regime_idx]
+    _vol_regime_vals = _vol_regime_vals[~np.isnan(_vol_regime_vals)]
+    if len(_vol_regime_vals) >= 10:
+        _regime_vol_p5  = float(np.percentile(_vol_regime_vals, 5))
+        _regime_vol_p95 = float(np.percentile(_vol_regime_vals, 95))
+    else:
+        # Degenerate dataset — store None so the live gate is skipped rather than
+        # incorrectly blocking all signals on a model trained with too little data.
+        _regime_vol_p5  = None
+        _regime_vol_p95 = None
+    log.info(
+        "train: vol_regime training distribution — n=%d p5=%.4f p95=%.4f",
+        len(_vol_regime_vals),
+        _regime_vol_p5 if _regime_vol_p5 is not None else float("nan"),
+        _regime_vol_p95 if _regime_vol_p95 is not None else float("nan"),
+    )
+
+    # ---------------------------------------------------------------------------
     # Walk-forward validation — purely for evaluation/reporting.
     # Runs BEFORE the final model fit so results are logged early.
     # Does NOT save any model to disk. Does NOT influence the final threshold.
@@ -737,6 +763,12 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         "wf_max_wr": wf_results["max_wr"],
         "wf_folds": len(wf_results["fold_results"]),
         "wf_fold_results": wf_results["fold_results"],
+        # Regime gate bounds — 5th/95th percentile of vol_regime across full training set.
+        # Used by live inference to suppress signals when the market is in a volatility
+        # regime not well-represented in training data (covariate shift guard).
+        # None means the gate is disabled for this model (insufficient training data).
+        "regime_vol_p5":  _regime_vol_p5,
+        "regime_vol_p95": _regime_vol_p95,
         # Common
         "sample_count": n,
         "train_size": val_start,
